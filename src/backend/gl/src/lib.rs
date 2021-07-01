@@ -32,7 +32,7 @@ use std::{
     thread,
 };
 
-use hal::{adapter, buffer, image, memory, queue as q};
+use hal::{adapter, buffer, display, image, memory, queue as q};
 
 pub use self::device::Device;
 pub use self::info::{Info, PlatformName, Version};
@@ -117,6 +117,9 @@ impl hal::Backend for Backend {
     type Semaphore = native::Semaphore;
     type Event = ();
     type QueryPool = ();
+
+    type Display = ();
+    type DisplayMode = ();
 }
 
 #[derive(Copy, Clone, Eq, PartialEq, Debug)]
@@ -605,6 +608,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             linear_tiling: If::TRANSFER_SRC | If::TRANSFER_DST | If::empty(),
             optimal_tiling: If::TRANSFER_SRC | If::TRANSFER_DST | If::SAMPLED,
             buffer_features: Bf::VERTEX,
+            drm_format_properties: Vec::new(),
         }
     }
 
@@ -666,12 +670,64 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         }
     }
 
+    fn external_buffer_properties(
+        &self,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _memory_type: hal::external_memory::ExternalMemoryType,
+    ) -> hal::external_memory::ExternalMemoryProperties {
+        unimplemented!()
+    }
+
+    fn external_image_properties(
+        &self,
+        _format: hal::format::Format,
+        _dimensions: u8,
+        _tiling: image::Tiling,
+        _usage: image::Usage,
+        _view_caps: image::ViewCapabilities,
+        _memory_type: hal::external_memory::ExternalMemoryType,
+    ) -> Result<
+        hal::external_memory::ExternalMemoryProperties,
+        hal::external_memory::ExternalImagePropertiesError,
+    > {
+        unimplemented!()
+    }
+
     fn features(&self) -> hal::Features {
         self.0.supported_features
     }
 
     fn properties(&self) -> hal::PhysicalDeviceProperties {
         self.0.public_caps
+    }
+
+    unsafe fn enumerate_displays(&self) -> Vec<display::Display<crate::Backend>> {
+        unimplemented!();
+    }
+
+    unsafe fn enumerate_compatible_planes(
+        &self,
+        _display: &display::Display<crate::Backend>,
+    ) -> Vec<display::Plane> {
+        unimplemented!();
+    }
+
+    unsafe fn create_display_mode(
+        &self,
+        _display: &display::Display<crate::Backend>,
+        _resolution: (u32, u32),
+        _refresh_rate: u32,
+    ) -> Result<display::DisplayMode<crate::Backend>, display::DisplayModeError> {
+        unimplemented!();
+    }
+
+    unsafe fn create_display_plane<'a>(
+        &self,
+        _display: &'a display::DisplayMode<crate::Backend>,
+        _plane: &'a display::Plane,
+    ) -> Result<display::DisplayPlane<'a, crate::Backend>, hal::device::OutOfMemory> {
+        unimplemented!();
     }
 }
 

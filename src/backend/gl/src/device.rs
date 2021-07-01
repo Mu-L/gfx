@@ -9,7 +9,7 @@ use crate::{
 
 use hal::{
     buffer, device as d,
-    format::{Format, Swizzle},
+    format::{ChannelType, Format, Swizzle},
     image as i, memory, pass,
     pool::CommandPoolCreateFlags,
     pso, query, queue,
@@ -57,7 +57,6 @@ impl<'a> CompilationContext<'a> {
 pub struct Device {
     pub(crate) share: Starc<Share>,
     features: hal::Features,
-    pub always_prefer_naga: bool,
     #[cfg(feature = "cross")]
     spv_options: naga::back::spv::Options,
 }
@@ -74,25 +73,9 @@ impl Device {
         Device {
             share: share,
             features,
-            always_prefer_naga: false,
             #[cfg(feature = "cross")]
             spv_options: {
                 use naga::back::spv;
-                let capabilities = [
-                    spv::Capability::Shader,
-                    spv::Capability::Matrix,
-                    spv::Capability::InputAttachment,
-                    spv::Capability::Sampled1D,
-                    spv::Capability::Image1D,
-                    spv::Capability::SampledBuffer,
-                    spv::Capability::ImageBuffer,
-                    spv::Capability::ImageQuery,
-                    spv::Capability::DerivativeControl,
-                    //TODO: fill out the rest
-                ]
-                .iter()
-                .cloned()
-                .collect();
                 let mut flags = spv::WriterFlags::empty();
                 flags.set(spv::WriterFlags::DEBUG, cfg!(debug_assertions));
                 flags.set(
@@ -102,7 +85,8 @@ impl Device {
                 spv::Options {
                     lang_version: (1, 0),
                     flags,
-                    capabilities,
+                    // doesn't matter since we send it through SPIRV-Cross
+                    capabilities: None,
                 }
             },
         }
@@ -161,6 +145,8 @@ impl Device {
             name_binding_map: &mut name_binding_map,
         };
 
+        let mut shaders_to_delete = arrayvec::ArrayVec::<[_; 3]>::new();
+
         for &(stage, point_maybe) in shaders {
             if let Some(point) = point_maybe {
                 match stage {
@@ -177,7 +163,7 @@ impl Device {
                     })?;
                 unsafe {
                     gl.attach_shader(program, shader);
-                    gl.delete_shader(shader);
+                    shaders_to_delete.push(shader);
                 }
             }
         }
@@ -204,13 +190,20 @@ impl Device {
             .unwrap();
             unsafe {
                 gl.attach_shader(program, shader);
-                gl.delete_shader(shader);
+                shaders_to_delete.push(shader);
             }
         }
 
         unsafe {
             gl.link_program(program);
         }
+
+        for shader in shaders_to_delete {
+            unsafe {
+                gl.delete_shader(shader);
+            }
+        }
+
         log::info!("\tLinked program {:?}", program);
         if let Err(err) = self.share.check() {
             panic!("Error linking program: {:?}", err);
@@ -605,7 +598,7 @@ impl Device {
         options: &naga::back::glsl::Options,
         context: CompilationContext,
     ) -> Result<n::Shader, d::ShaderError> {
-        let mut output = Vec::new();
+        let mut output = String::new();
         let mut writer =
             naga::back::glsl::Writer::new(&mut output, &shader.module, &shader.info, options)
                 .map_err(|e| {
@@ -629,9 +622,8 @@ impl Device {
                     reflection_info,
                     context,
                 );
-                let source = String::from_utf8(output).unwrap();
-                log::debug!("Naga generated shader:\n{}", source);
-                Self::create_shader_module_raw(gl, &source, options.shader_stage)
+                log::debug!("Naga generated shader:\n{}", output);
+                Self::create_shader_module_raw(gl, &output, options.shader_stage)
             }
             Err(e) => {
                 log::warn!("Naga GLSL write: {}", e);
@@ -661,17 +653,16 @@ impl Device {
             entry_point: ep.entry.to_string(),
         };
 
-        let mut result = Err(d::ShaderError::CompilationFailed(String::new()));
-        if ep.module.prefer_naga {
-            if let Some(ref shader) = ep.module.naga {
-                result = Self::compile_shader_library_naga(
-                    &self.share.context,
-                    shader,
-                    &naga_options,
-                    context.reborrow(),
-                );
-            }
-        }
+        #[cfg_attr(not(feature = "cross"), allow(unused_mut))]
+        let mut result = match ep.module.naga {
+            Ok(ref shader) => Self::compile_shader_library_naga(
+                &self.share.context,
+                shader,
+                &naga_options,
+                context.reborrow(),
+            ),
+            Err(ref e) => Err(d::ShaderError::CompilationFailed(e.clone())),
+        };
         #[cfg(feature = "cross")]
         if result.is_err() {
             let mut ast = self.parse_spirv_cross(&ep.module.spv).unwrap();
@@ -685,16 +676,6 @@ impl Device {
                 .unwrap();
             log::debug!("SPIRV-Cross generated shader:\n{}", glsl);
             result = Self::create_shader_module_raw(&self.share.context, &glsl, stage);
-        }
-        if result.is_err() && !ep.module.prefer_naga {
-            if let Some(ref shader) = ep.module.naga {
-                result = Self::compile_shader_library_naga(
-                    &self.share.context,
-                    shader,
-                    &naga_options,
-                    context,
-                );
-            }
         }
         result
     }
@@ -1200,29 +1181,31 @@ impl d::Device<B> for Device {
         raw_data: &[u32],
     ) -> Result<n::ShaderModule, d::ShaderError> {
         Ok(n::ShaderModule {
-            prefer_naga: self.always_prefer_naga,
             #[cfg(feature = "cross")]
             spv: raw_data.to_vec(),
-            naga: {
-                let parser =
-                    naga::front::spv::Parser::new(raw_data.iter().cloned(), &Default::default());
+            naga: if cfg!(feature = "cross") {
+                Err("Cross is enabled".into())
+            } else {
+                let options = naga::front::spv::Options {
+                    adjust_coordinate_space: !self.features.contains(hal::Features::NDC_Y_UP),
+                    strict_capabilities: true,
+                    flow_graph_dump_prefix: None,
+                };
+                let parser = naga::front::spv::Parser::new(raw_data.iter().cloned(), &options);
                 match parser.parse() {
                     Ok(module) => {
                         log::debug!("Naga module {:#?}", module);
-                        match naga::valid::Validator::new(naga::valid::ValidationFlags::empty())
-                            .validate(&module)
+                        match naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::empty(),
+                            naga::valid::Capabilities::empty(), //TODO: PUSH_CONSTANT
+                        )
+                        .validate(&module)
                         {
-                            Ok(info) => Some(d::NagaShader { module, info }),
-                            Err(e) => {
-                                log::warn!("Naga validation failed: {:?}", e);
-                                None
-                            }
+                            Ok(info) => Ok(d::NagaShader { module, info }),
+                            Err(e) => Err(format!("Naga validation: {}", e)),
                         }
                     }
-                    Err(e) => {
-                        log::warn!("Naga parsing failed: {:?}", e);
-                        None
-                    }
+                    Err(e) => Err(format!("Naga parsing: {:?}", e)),
                 }
             },
         })
@@ -1233,7 +1216,6 @@ impl d::Device<B> for Device {
         shader: d::NagaShader,
     ) -> Result<n::ShaderModule, (d::ShaderError, d::NagaShader)> {
         Ok(n::ShaderModule {
-            prefer_naga: true,
             #[cfg(feature = "cross")]
             spv: match naga::back::spv::write_vec(&shader.module, &shader.info, &self.spv_options) {
                 Ok(spv) => spv,
@@ -1241,7 +1223,7 @@ impl d::Device<B> for Device {
                     return Err((d::ShaderError::CompilationFailed(format!("{}", e)), shader))
                 }
             },
-            naga: Some(shader),
+            naga: Ok(shader),
         })
     }
 
@@ -1523,6 +1505,21 @@ impl d::Device<B> for Device {
                             h = std::cmp::max(h / 2, 1);
                         }
                     }
+                    match channel {
+                        ChannelType::Uint | ChannelType::Sint => {
+                            gl.tex_parameter_i32(
+                                glow::TEXTURE_2D,
+                                glow::TEXTURE_MIN_FILTER,
+                                glow::NEAREST as _,
+                            );
+                            gl.tex_parameter_i32(
+                                glow::TEXTURE_2D,
+                                glow::TEXTURE_MAG_FILTER,
+                                glow::NEAREST as _,
+                            );
+                        }
+                        _ => {}
+                    };
                     glow::TEXTURE_2D
                 }
                 i::Kind::D2(w, h, l, 1) => {
@@ -1563,6 +1560,21 @@ impl d::Device<B> for Device {
                             h = std::cmp::max(h / 2, 1);
                         }
                     }
+                    match channel {
+                        ChannelType::Uint | ChannelType::Sint => {
+                            gl.tex_parameter_i32(
+                                glow::TEXTURE_2D,
+                                glow::TEXTURE_MIN_FILTER,
+                                glow::NEAREST as _,
+                            );
+                            gl.tex_parameter_i32(
+                                glow::TEXTURE_2D,
+                                glow::TEXTURE_MAG_FILTER,
+                                glow::NEAREST as _,
+                            );
+                        }
+                        _ => {}
+                    };
                     glow::TEXTURE_2D_ARRAY
                 }
                 _ => unimplemented!(),
@@ -1667,6 +1679,7 @@ impl d::Device<B> for Device {
         kind: i::ViewKind,
         view_format: Format,
         swizzle: Swizzle,
+        _usage: i::Usage,
         range: i::SubresourceRange,
     ) -> Result<n::ImageView, i::ViewCreationError> {
         assert_eq!(swizzle, Swizzle::NO);
@@ -1696,7 +1709,7 @@ impl d::Device<B> for Device {
                 };
                 match conv::describe_format(view_format) {
                     Some(description) => {
-                        let raw_view_format = description.tex_internal;
+                        let raw_view_format = description.tex_external;
                         if format != raw_view_format {
                             log::warn!(
                                 "View format {:?} is different from base {:?}",
@@ -2130,6 +2143,97 @@ impl d::Device<B> for Device {
         _name: &str,
     ) {
         // TODO
+    }
+
+    unsafe fn set_display_power_state(
+        &self,
+        _display: &hal::display::Display<B>,
+        _power_state: &hal::display::control::PowerState,
+    ) -> Result<(), hal::display::control::DisplayControlError> {
+        unimplemented!()
+    }
+
+    unsafe fn register_device_event(
+        &self,
+        _device_event: &hal::display::control::DeviceEvent,
+        _fence: &mut <B as hal::Backend>::Fence,
+    ) -> Result<(), hal::display::control::DisplayControlError> {
+        unimplemented!()
+    }
+
+    unsafe fn register_display_event(
+        &self,
+        _display: &hal::display::Display<B>,
+        _display_event: &hal::display::control::DisplayEvent,
+        _fence: &mut <B as hal::Backend>::Fence,
+    ) -> Result<(), hal::display::control::DisplayControlError> {
+        unimplemented!()
+    }
+
+    unsafe fn create_allocate_external_buffer(
+        &self,
+        _external_memory_type: hal::external_memory::ExternalBufferMemoryType,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _type_mask: u32,
+        _size: u64,
+    ) -> Result<(n::Buffer, n::Memory), hal::external_memory::ExternalResourceError>
+    {
+        unimplemented!()
+    }
+
+    unsafe fn import_external_buffer(
+        &self,
+        _external_memory: hal::external_memory::ExternalBufferMemory,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _type_mask: u32,
+        _size: u64,
+    ) -> Result<(n::Buffer, n::Memory), hal::external_memory::ExternalResourceError> {
+        unimplemented!()
+    }
+
+    unsafe fn create_allocate_external_image(
+        &self,
+        _external_memory_type: hal::external_memory::ExternalImageMemoryType,
+        _kind: i::Kind,
+        _num_levels: i::Level,
+        _format: Format,
+        _tiling: i::Tiling,
+        _usage: i::Usage,
+        _sparse: memory::SparseFlags,
+        _view_caps: i::ViewCapabilities,
+        _type_mask: u32,
+    ) -> Result<(n::Image, n::Memory), hal::external_memory::ExternalResourceError> {
+        unimplemented!()
+    }
+
+    unsafe fn import_external_image(
+        &self,
+        _external_memory: hal::external_memory::ExternalImageMemory,
+        _kind: i::Kind,
+        _num_levels: i::Level,
+        _format: Format,
+        _tiling: i::Tiling,
+        _usage: i::Usage,
+        _sparse: memory::SparseFlags,
+        _view_caps: i::ViewCapabilities,
+        _type_mask: u32,
+    ) -> Result<(n::Image, n::Memory), hal::external_memory::ExternalResourceError> {
+        unimplemented!()
+    }
+
+    unsafe fn export_memory(
+        &self,
+        _external_memory_type: hal::external_memory::ExternalMemoryType,
+        _memory: &n::Memory,
+    ) -> Result<hal::external_memory::PlatformMemory, hal::external_memory::ExternalMemoryExportError>
+    {
+        unimplemented!()
+    }
+
+    unsafe fn drm_format_modifier(&self, _image: &n::Image) -> Option<hal::format::DrmModifier> {
+        None
     }
 
     fn start_capture(&self) {

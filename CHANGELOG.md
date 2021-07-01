@@ -1,11 +1,46 @@
 # Change Log
 
-### unreleased
-  - the new "bench" example is added
-  - timestamp period query is moved to the `Queue`
-  - `DescriptorLimits` is added to consolidate descriptor-related limits and its fields changed from `usize` to `u32`
-  - `Limits` and `Capabilities` structures merged together as `PhysicalDeviceProperties`
-  - Entries for Mesh Shading and Descriptor Indexing added to `PhysicalDeviceProperties`
+### hal-0.9.0 (18-06-2021)
+  - This is the final crates-published release of gfx-hal. gfx-hal development was mainly driven by wgpu which has now switched to its own GPU abstraction: wgpu-hal. As such, gfx-hal will be in maintence mode until the story of gfx-portability is figured out. Read more about the transition in #3768.
+  - MTL: Prevent accessing NSView on other threads.
+  - Fix panics when android apps reopen.
+  - Support dynamic array sizes on metal.
+  - Added backend agnostic RenderDoc captures.
+  - Allow initialization of gfx objects from raw handles.
+  - Add missing features to the dx12 backend that are needed by wgpu.
+  - Made `PhysicalDevice::enabled_extensions` public.
+  - Added the ability to import formeign memory
+  - GLES: Deferred deleting shaders until after linking
+  - GLES: Fix texture views
+  - GLES: Fix nearest neighbor filtering.
+  - Assorted: Documentation fixes
+
+### backend-metal-0.8.2 (08-05-2021)
+  - fix linking to QuartzCore
+
+### hal-0.8.0 (29-04-2021)
+  - Naga is the required and preferred shader translation path in Metal and OpenGL
+  - enabling SPIRV-Cross is optional behind `cross` feature
+  API: 
+    - all backends can create shader modules from `naga::Module`
+    - sampler reduction modes (min/max samplers)
+    - image view creation requires `image::Usage` to be specified
+    - timestamp period query is moved to the `Queue`
+    - `DescriptorLimits` is added to consolidate descriptor-related limits and its fields changed from `usize` to `u32`
+    - `Limits` and `Capabilities` structures merged together as `PhysicalDeviceProperties`
+    - Entries for Mesh Shading and Descriptor Indexing added to `PhysicalDeviceProperties`
+    - buffer descriptor indexing
+    - sparse memory binding
+    - blend color is renamed to blend constants
+    - debug capture API for interfacing with XCode/RenderDoc/PIX
+    - better shader and pipeline creation errors
+  - Infrastructure:
+    - the new "bench" example is added
+  - Metal backend:
+    - pipeline cache support with binary archives
+    - `profiling` integration
+    - immutable sampler support on Naga path
+    - improve window resizing, expose "present with transaction" option
 
 ## hal-0.7.0 (30-01-2021)
   - `Borrow` and `ExactSizeIterator` bounds are removed from the iterators

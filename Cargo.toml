@@ -2,7 +2,9 @@
 
 members = [
     "src/auxil/auxil",
+    "src/auxil/external-memory",
     "src/auxil/range-alloc",
+    "src/auxil/renderdoc",
     "src/backend/dx11",
     "src/backend/dx12",
     "src/backend/empty",

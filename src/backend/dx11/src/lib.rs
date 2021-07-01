@@ -24,8 +24,9 @@ extern crate log;
 use crate::{debug::set_debug_name, device::DepthStencilState};
 use auxil::ShaderStage;
 use hal::{
-    adapter, buffer, command, format, image, memory, pass, pso, query, queue, window, DrawCount,
-    IndexCount, IndexType, InstanceCount, TaskCount, VertexCount, VertexOffset, WorkGroupCount,
+    adapter, buffer, command, display, format, image, memory, pass, pso, query, queue, window,
+    DrawCount, IndexCount, IndexType, InstanceCount, TaskCount, VertexCount, VertexOffset,
+    WorkGroupCount,
 };
 use range_alloc::RangeAllocator;
 use smallvec::SmallVec;
@@ -390,7 +391,11 @@ fn get_limits(feature_level: d3dcommon::D3D_FEATURE_LEVEL) -> hal::Limits {
 fn get_format_properties(
     device: ComPtr<d3d11::ID3D11Device>,
 ) -> [format::Properties; format::NUM_FORMATS] {
-    let mut format_properties = [format::Properties::default(); format::NUM_FORMATS];
+    let mut format_properties: [format::Properties; format::NUM_FORMATS] =
+        unsafe { std::mem::zeroed() };
+    format_properties
+        .iter_mut()
+        .for_each(|format_properties| *format_properties = format::Properties::default());
     for (i, props) in &mut format_properties.iter_mut().enumerate().skip(1) {
         let format: format::Format = unsafe { mem::transmute(i as u32) };
 
@@ -660,6 +665,17 @@ impl hal::Instance<Backend> for Instance {
     unsafe fn destroy_surface(&self, _surface: Surface) {
         // TODO: Implement Surface cleanup
     }
+
+    unsafe fn create_display_plane_surface(
+        &self,
+        _display_plane: &display::DisplayPlane<crate::Backend>,
+        _plane_stack_index: u32,
+        _transformation: display::SurfaceTransform,
+        _alpha: display::DisplayPlaneAlpha,
+        _image_extent: hal::window::Extent2D,
+    ) -> Result<Surface, display::DisplayPlaneSurfaceError> {
+        unimplemented!();
+    }
 }
 
 pub struct PhysicalDevice {
@@ -859,7 +875,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
 
     fn format_properties(&self, fmt: Option<format::Format>) -> format::Properties {
         let idx = fmt.map(|fmt| fmt as usize).unwrap_or(0);
-        self.format_properties[idx]
+        self.format_properties[idx].clone()
     }
 
     fn image_format_properties(
@@ -965,12 +981,64 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
         self.memory_properties.clone()
     }
 
+    fn external_buffer_properties(
+        &self,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _memory_type: hal::external_memory::ExternalMemoryType,
+    ) -> hal::external_memory::ExternalMemoryProperties {
+        unimplemented!()
+    }
+
+    fn external_image_properties(
+        &self,
+        _format: hal::format::Format,
+        _dimensions: u8,
+        _tiling: hal::image::Tiling,
+        _usage: hal::image::Usage,
+        _view_caps: hal::image::ViewCapabilities,
+        _memory_type: hal::external_memory::ExternalMemoryType,
+    ) -> Result<
+        hal::external_memory::ExternalMemoryProperties,
+        hal::external_memory::ExternalImagePropertiesError,
+    > {
+        unimplemented!()
+    }
+
     fn features(&self) -> hal::Features {
         self.features
     }
 
     fn properties(&self) -> hal::PhysicalDeviceProperties {
         self.properties
+    }
+
+    unsafe fn enumerate_displays(&self) -> Vec<display::Display<crate::Backend>> {
+        unimplemented!();
+    }
+
+    unsafe fn enumerate_compatible_planes(
+        &self,
+        _display: &display::Display<crate::Backend>,
+    ) -> Vec<display::Plane> {
+        unimplemented!();
+    }
+
+    unsafe fn create_display_mode(
+        &self,
+        _display: &display::Display<crate::Backend>,
+        _resolution: (u32, u32),
+        _refresh_rate: u32,
+    ) -> Result<display::DisplayMode<crate::Backend>, display::DisplayModeError> {
+        unimplemented!();
+    }
+
+    unsafe fn create_display_plane<'a>(
+        &self,
+        _display: &'a display::DisplayMode<crate::Backend>,
+        _plane: &'a display::Plane,
+    ) -> Result<display::DisplayPlane<'a, crate::Backend>, hal::device::OutOfMemory> {
+        unimplemented!();
     }
 }
 
@@ -2811,29 +2879,108 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
             assert_eq!(size % 4, 0, "Buffer sub range size must be multiple of 4");
         }
 
-        let mut desc: d3d11::D3D11_UNORDERED_ACCESS_VIEW_DESC = mem::zeroed();
-        desc.Format = dxgiformat::DXGI_FORMAT_R32_TYPELESS;
-        desc.ViewDimension = d3d11::D3D11_UAV_DIMENSION_BUFFER;
-        *desc.u.Buffer_mut() = d3d11::D3D11_BUFFER_UAV {
-            FirstElement: sub.offset as u32 / 4,
-            NumElements: sub.size.unwrap_or(buffer.requirements.size) as u32 / 4,
-            Flags: d3d11::D3D11_BUFFER_UAV_FLAG_RAW,
-        };
+        // TODO: expose this requirement to the user to enable avoiding the unaligned fill for
+        // performance
+        // FirstElement must be a multiple of 4 (since each element is 4 bytes and the
+        // offset needs to be a multiple of 16 bytes)
+        let element_offset = sub.offset as u32 / 4;
+        let num_elements = sub.size.unwrap_or(buffer.requirements.size) as u32 / 4;
 
-        let mut uav: *mut d3d11::ID3D11UnorderedAccessView = ptr::null_mut();
-        let hr = device.CreateUnorderedAccessView(
-            buffer.internal.raw as *mut _,
-            &desc,
-            &mut uav as *mut *mut _ as *mut *mut _,
-        );
-        let uav = ComPtr::from_raw(uav);
-
-        if !winerror::SUCCEEDED(hr) {
-            panic!("fill_buffer failed to make UAV failed: 0x{:x}", hr);
+        fn up_align(x: u32, alignment: u32) -> u32 {
+            (x + alignment - 1) & !(alignment - 1)
         }
 
-        self.context
-            .ClearUnorderedAccessViewUint(uav.as_raw(), &[data; 4]);
+        let aligned_element_offset = up_align(element_offset, 4);
+        let unaligned_num_elements = (aligned_element_offset - element_offset).min(num_elements);
+        let aligned_num_elements = num_elements - unaligned_num_elements;
+
+        // Use ClearUnorderedAccessViewUint to fill from the 16 byte aligned offset
+        if aligned_num_elements > 0 {
+            let mut desc: d3d11::D3D11_UNORDERED_ACCESS_VIEW_DESC = mem::zeroed();
+            desc.Format = dxgiformat::DXGI_FORMAT_R32_TYPELESS;
+            desc.ViewDimension = d3d11::D3D11_UAV_DIMENSION_BUFFER;
+            *desc.u.Buffer_mut() = d3d11::D3D11_BUFFER_UAV {
+                FirstElement: aligned_element_offset,
+                NumElements: aligned_num_elements,
+                Flags: d3d11::D3D11_BUFFER_UAV_FLAG_RAW,
+            };
+
+            let mut uav: *mut d3d11::ID3D11UnorderedAccessView = ptr::null_mut();
+            let hr = device.CreateUnorderedAccessView(
+                buffer.internal.raw as *mut _,
+                &desc,
+                &mut uav as *mut *mut _ as *mut *mut _,
+            );
+
+            if !winerror::SUCCEEDED(hr) {
+                panic!("fill_buffer failed to make UAV failed: 0x{:x}", hr);
+            }
+
+            let uav = ComPtr::from_raw(uav);
+
+            self.context
+                .ClearUnorderedAccessViewUint(uav.as_raw(), &[data; 4]);
+        }
+
+        // If there is unaligned portion at the beginning of the sub region
+        // create a new buffer with the fill data to copy into this region
+        if unaligned_num_elements > 0 {
+            debug_assert!(
+                unaligned_num_elements < 4,
+                "The number of unaligned elements is {} but it should be less than 4",
+                unaligned_num_elements
+            );
+
+            let initial_data = [data; 4];
+
+            let initial_data = d3d11::D3D11_SUBRESOURCE_DATA {
+                pSysMem: initial_data.as_ptr() as *const _,
+                SysMemPitch: 0,
+                SysMemSlicePitch: 0,
+            };
+
+            // TODO: consider using a persistent buffer like the working_buffer
+            let desc = d3d11::D3D11_BUFFER_DESC {
+                ByteWidth: core::mem::size_of_val(&initial_data) as _,
+                Usage: d3d11::D3D11_USAGE_DEFAULT,
+                BindFlags: 0,
+                CPUAccessFlags: 0,
+                MiscFlags: 0,
+                StructureByteStride: 0,
+            };
+            let mut temp_buffer = ptr::null_mut::<d3d11::ID3D11Buffer>();
+
+            assert_eq!(
+                winerror::S_OK,
+                device.CreateBuffer(
+                    &desc,
+                    &initial_data,
+                    &mut temp_buffer as *mut *mut _ as *mut *mut _,
+                )
+            );
+
+            let temp_buffer = ComPtr::from_raw(temp_buffer);
+
+            let src_box = d3d11::D3D11_BOX {
+                left: 0,
+                top: 0,
+                front: 0,
+                right: (unaligned_num_elements * core::mem::size_of::<u32>() as u32) as _,
+                bottom: 1,
+                back: 1,
+            };
+
+            self.context.CopySubresourceRegion(
+                buffer.internal.raw as _,
+                0,
+                sub.offset as _, // offset in bytes
+                0,
+                0,
+                temp_buffer.as_raw() as _,
+                0,
+                &src_box,
+            );
+        }
     }
 
     unsafe fn update_buffer(&mut self, _buffer: &Buffer, _offset: buffer::Offset, _data: &[u8]) {
@@ -2849,7 +2996,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
         }
 
         for info in regions {
-            let dst_box = d3d11::D3D11_BOX {
+            let src_box = d3d11::D3D11_BOX {
                 left: info.src as _,
                 top: 0,
                 front: 0,
@@ -2866,7 +3013,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
                 0,
                 src.internal.raw as _,
                 0,
-                &dst_box,
+                &src_box,
             );
 
             if let Some(disjoint_cb) = dst.internal.disjoint_cb {
@@ -2878,7 +3025,7 @@ impl command::CommandBuffer<Backend> for CommandBuffer {
                     0,
                     src.internal.raw as _,
                     0,
-                    &dst_box,
+                    &src_box,
                 );
             }
         }
@@ -4368,6 +4515,9 @@ impl hal::Backend for Backend {
     type Semaphore = Semaphore;
     type Event = ();
     type QueryPool = QueryPool;
+
+    type Display = ();
+    type DisplayMode = ();
 }
 
 fn validate_line_width(width: f32) {

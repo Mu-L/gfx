@@ -1,5 +1,5 @@
-#[cfg(feature = "cross")]
-use crate::internal::FastStorageMap;
+#[cfg(feature = "pipeline-cache")]
+use crate::pipeline_cache;
 use crate::{
     command, conversions as conv, internal::Channel, native as n, AsNative, Backend, FastHashMap,
     OnlineRecording, QueueFamily, ResourceIndex, Shared, VisibilityShared,
@@ -11,7 +11,7 @@ use cocoa_foundation::foundation::NSUInteger;
 use copyless::VecHelper;
 use foreign_types::{ForeignType, ForeignTypeRef};
 use hal::{
-    adapter, buffer, device as d, format, image, memory,
+    adapter, buffer, device as d, display, format, image, memory,
     memory::Properties,
     pass,
     pool::CommandPoolCreateFlags,
@@ -29,13 +29,13 @@ use objc::{
     rc::autoreleasepool,
     runtime::{Object, BOOL, NO},
 };
-use parking_lot::Mutex;
+use parking_lot::{Mutex, MutexGuard};
 
-#[cfg(feature = "cross")]
-use std::collections::{hash_map::Entry, BTreeMap};
+use std::collections::BTreeMap;
+#[cfg(feature = "pipeline-cache")]
+use std::io::Write;
 use std::{
-    cmp,
-    iter, mem,
+    cmp, iter, mem,
     ops::Range,
     ptr,
     sync::{
@@ -134,6 +134,14 @@ impl VisibilityShared {
     }
 }
 
+struct CompiledShader {
+    library: metal::Library,
+    function: metal::Function,
+    wg_size: metal::MTLSize,
+    rasterizing: bool,
+    sized_bindings: Vec<naga::ResourceBinding>,
+}
+
 #[derive(Debug)]
 pub struct Device {
     pub(crate) shared: Arc<Shared>,
@@ -141,8 +149,7 @@ pub struct Device {
     memory_types: Vec<adapter::MemoryType>,
     features: hal::Features,
     pub online_recording: OnlineRecording,
-    pub always_prefer_naga: bool,
-    #[cfg(feature = "cross")]
+    #[cfg(any(feature = "pipeline-cache", feature = "cross"))]
     spv_options: naga::back::spv::Options,
 }
 unsafe impl Send for Device {}
@@ -261,24 +268,9 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             queue_group.add_queue(command::Queue::new(self.shared.clone()));
         }
 
-        #[cfg(feature = "cross")]
+        #[cfg(any(feature = "pipeline-cache", feature = "cross"))]
         let spv_options = {
             use naga::back::spv;
-            let capabilities = [
-                spv::Capability::Shader,
-                spv::Capability::Matrix,
-                spv::Capability::InputAttachment,
-                spv::Capability::Sampled1D,
-                spv::Capability::Image1D,
-                spv::Capability::SampledBuffer,
-                spv::Capability::ImageBuffer,
-                spv::Capability::ImageQuery,
-                spv::Capability::DerivativeControl,
-                //TODO: fill out the rest
-            ]
-            .iter()
-            .cloned()
-            .collect();
             let mut flags = spv::WriterFlags::empty();
             flags.set(spv::WriterFlags::DEBUG, cfg!(debug_assertions));
             flags.set(
@@ -288,7 +280,8 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             spv::Options {
                 lang_version: (1, 0),
                 flags,
-                capabilities,
+                // doesn't matter since we send it through SPIRV-Cross
+                capabilities: None,
             }
         };
 
@@ -298,8 +291,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             memory_types: self.memory_types.clone(),
             features: requested_features,
             online_recording: OnlineRecording::default(),
-            always_prefer_naga: false,
-            #[cfg(feature = "cross")]
+            #[cfg(any(feature = "pipeline-cache", feature = "cross"))]
             spv_options,
         };
 
@@ -316,6 +308,7 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
                 linear_tiling: format::ImageFeature::empty(),
                 optimal_tiling: format::ImageFeature::empty(),
                 buffer_features: format::BufferFeature::empty(),
+                drm_format_properties: Vec::new(),
             },
         }
     }
@@ -397,6 +390,30 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             ],
             memory_types: self.memory_types.to_vec(),
         }
+    }
+
+    fn external_buffer_properties(
+        &self,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _memory_type: hal::external_memory::ExternalMemoryType,
+    ) -> hal::external_memory::ExternalMemoryProperties {
+        unimplemented!()
+    }
+
+    fn external_image_properties(
+        &self,
+        _format: hal::format::Format,
+        _dimensions: u8,
+        _tiling: hal::image::Tiling,
+        _usage: hal::image::Usage,
+        _view_caps: hal::image::ViewCapabilities,
+        _memory_type: hal::external_memory::ExternalMemoryType,
+    ) -> Result<
+        hal::external_memory::ExternalMemoryProperties,
+        hal::external_memory::ExternalImagePropertiesError,
+    > {
+        unimplemented!()
     }
 
     fn features(&self) -> hal::Features {
@@ -556,6 +573,34 @@ impl adapter::PhysicalDevice<Backend> for PhysicalDevice {
             ..hal::PhysicalDeviceProperties::default()
         }
     }
+
+    unsafe fn enumerate_displays(&self) -> Vec<hal::display::Display<crate::Backend>> {
+        unimplemented!();
+    }
+
+    unsafe fn enumerate_compatible_planes(
+        &self,
+        _display: &hal::display::Display<crate::Backend>,
+    ) -> Vec<hal::display::Plane> {
+        unimplemented!();
+    }
+
+    unsafe fn create_display_mode(
+        &self,
+        _display: &hal::display::Display<crate::Backend>,
+        _resolution: (u32, u32),
+        _refresh_rate: u32,
+    ) -> Result<hal::display::DisplayMode<crate::Backend>, hal::display::DisplayModeError> {
+        unimplemented!();
+    }
+
+    unsafe fn create_display_plane<'a>(
+        &self,
+        _display: &'a hal::display::DisplayMode<crate::Backend>,
+        _plane: &'a hal::display::Plane,
+    ) -> Result<hal::display::DisplayPlane<'a, crate::Backend>, d::OutOfMemory> {
+        unimplemented!();
+    }
 }
 
 pub struct LanguageVersion {
@@ -570,6 +615,11 @@ impl LanguageVersion {
 }
 
 impl Device {
+    /// Provides access to the underlying Metal device.
+    pub fn lock(&self) -> MutexGuard<'_, metal::Device> {
+        self.shared.device.lock()
+    }
+
     fn _is_heap_coherent(&self, heap: &n::MemoryHeap) -> bool {
         match *heap {
             n::MemoryHeap::Private => false,
@@ -677,12 +727,15 @@ impl Device {
         shader: &d::NagaShader,
         naga_options: &naga::back::msl::Options,
         pipeline_options: &naga::back::msl::PipelineOptions,
+        #[cfg(feature = "pipeline-cache")] spv_hash: u64,
+        #[cfg(feature = "pipeline-cache")] spv_to_msl_cache: Option<&pipeline_cache::SpvToMsl>,
     ) -> Result<n::ModuleInfo, String> {
         profiling::scope!("compile_shader_library_naga");
 
-        let (source, info) = {
-            profiling::scope!("naga::write_string");
-            match naga::back::msl::write_string(
+        let get_module_info = || {
+            profiling::scope!("naga::msl::write_string");
+
+            let (source, info) = match naga::back::msl::write_string(
                 &shader.module,
                 &shader.info,
                 naga_options,
@@ -693,26 +746,50 @@ impl Device {
                     warn!("Naga: {:?}", e);
                     return Err(format!("MSL: {:?}", e));
                 }
+            };
+
+            let mut entry_point_map = n::EntryPointMap::default();
+            for (ep, internal_name) in shader
+                .module
+                .entry_points
+                .iter()
+                .zip(info.entry_point_names)
+            {
+                entry_point_map.insert(
+                    (ep.stage, ep.name.clone()),
+                    n::EntryPoint {
+                        internal_name,
+                        work_group_size: ep.workgroup_size,
+                    },
+                );
             }
+
+            debug!("Naga generated shader:\n{}", source);
+
+            Ok(n::SerializableModuleInfo {
+                source,
+                entry_point_map,
+                rasterization_enabled: true, //TODO
+            })
         };
 
-        let mut entry_point_map = n::EntryPointMap::default();
-        for (ep, internal_name) in shader
-            .module
-            .entry_points
-            .iter()
-            .zip(info.entry_point_names)
-        {
-            entry_point_map.insert(
-                (ep.stage, ep.name.clone()),
-                n::EntryPoint {
-                    internal_name,
-                    work_group_size: ep.workgroup_size,
-                },
-            );
-        }
+        #[cfg(feature = "pipeline-cache")]
+        let module_info = if let Some(spv_to_msl_cache) = spv_to_msl_cache {
+            let key = pipeline_cache::SpvToMslKey {
+                options: naga_options.clone(),
+                pipeline_options: pipeline_options.clone(),
+                spv_hash,
+            };
 
-        debug!("Naga generated shader:\n{}", source);
+            spv_to_msl_cache
+                .get_or_create_with(&key, || get_module_info().unwrap())
+                .clone()
+        } else {
+            get_module_info()?
+        };
+
+        #[cfg(not(feature = "pipeline-cache"))]
+        let module_info = get_module_info()?;
 
         let options = metal::CompileOptions::new();
         let msl_version = match naga_options.lang_version {
@@ -731,9 +808,9 @@ impl Device {
             profiling::scope!("Metal::new_library_with_source");
             device
                 .lock()
-                .new_library_with_source(source.as_ref(), &options)
+                .new_library_with_source(module_info.source.as_ref(), &options)
                 .map_err(|err| {
-                    warn!("Naga generated shader:\n{}", source);
+                    warn!("Naga generated shader:\n{}", module_info.source);
                     warn!("Failed to compile: {}", err);
                     format!("{:?}", err)
                 })?
@@ -741,11 +818,12 @@ impl Device {
 
         Ok(n::ModuleInfo {
             library,
-            entry_point_map,
-            rasterization_enabled: true, //TODO
+            entry_point_map: module_info.entry_point_map,
+            rasterization_enabled: module_info.rasterization_enabled,
         })
     }
 
+    #[cfg_attr(not(feature = "pipeline-cache"), allow(unused_variables))]
     fn load_shader(
         &self,
         ep: &pso::EntryPoint<Backend>,
@@ -753,18 +831,15 @@ impl Device {
         primitive_class: MTLPrimitiveTopologyClass,
         pipeline_cache: Option<&n::PipelineCache>,
         stage: naga::ShaderStage,
-    ) -> Result<(metal::Library, metal::Function, metal::MTLSize, bool), pso::CreationError> {
+    ) -> Result<CompiledShader, pso::CreationError> {
         let _profiling_tag = match stage {
             naga::ShaderStage::Vertex => "vertex",
             naga::ShaderStage::Fragment => "fragment",
             naga::ShaderStage::Compute => "compute",
         };
-        profiling::scope!("load_shader", [_profiling_tag]);
+        profiling::scope!("load_shader", _profiling_tag);
 
         let device = &self.shared.device;
-        #[cfg(feature = "cross")]
-        let (module_map, info_guard);
-        let info_owned;
 
         #[cfg(feature = "cross")]
         let mut compiler_options = layout.spirv_cross_options.clone();
@@ -782,67 +857,60 @@ impl Device {
             },
         };
 
-        let info = match pipeline_cache {
+        let info = {
+            #[cfg_attr(not(feature = "cross"), allow(unused_mut))]
+            let mut result = match ep.module.naga {
+                Ok(ref shader) => Self::compile_shader_library_naga(
+                    device,
+                    shader,
+                    &layout.naga_options,
+                    &pipeline_options,
+                    #[cfg(feature = "pipeline-cache")]
+                    ep.module.spv_hash,
+                    #[cfg(feature = "pipeline-cache")]
+                    pipeline_cache.as_ref().map(|cache| &cache.spv_to_msl),
+                ),
+                Err(ref e) => Err(e.clone()),
+            };
+
             #[cfg(feature = "cross")]
-            Some(cache) => {
-                module_map = cache
-                    .modules
-                    .get_or_create_with(&compiler_options, FastStorageMap::default);
-                info_guard = module_map.get_or_create_with(&ep.module.spv, || {
-                    Self::compile_shader_library_cross(
-                        device,
-                        &ep.module.spv,
-                        &compiler_options,
-                        self.shared.private_caps.msl_version,
-                        &ep.specialization,
-                        stage,
-                    )
-                    .unwrap()
-                });
-                &*info_guard
+            if result.is_err() {
+                result = Self::compile_shader_library_cross(
+                    device,
+                    &ep.module.spv,
+                    &compiler_options,
+                    self.shared.private_caps.msl_version,
+                    &ep.specialization,
+                    stage,
+                );
             }
-            _ => {
-                let mut result = Err(String::new());
-                if ep.module.prefer_naga {
-                    result = match ep.module.naga {
-                        Ok(ref shader) => Self::compile_shader_library_naga(
-                            device,
-                            shader,
-                            &layout.naga_options,
-                            &pipeline_options,
-                        ),
-                        Err(ref e) => Err(e.clone()),
-                    }
-                }
-                #[cfg(feature = "cross")]
-                if result.is_err() {
-                    result = Self::compile_shader_library_cross(
-                        device,
-                        &ep.module.spv,
-                        &compiler_options,
-                        self.shared.private_caps.msl_version,
-                        &ep.specialization,
-                        stage,
-                    );
-                }
-                if result.is_err() && !ep.module.prefer_naga {
-                    result = match ep.module.naga {
-                        Ok(ref shader) => Self::compile_shader_library_naga(
-                            device,
-                            shader,
-                            &layout.naga_options,
-                            &pipeline_options,
-                        ),
-                        Err(ref e) => Err(e.clone()),
-                    }
-                }
-                info_owned = result.map_err(|e| {
-                    let error = format!("Error compiling the shader {:?}", e);
-                    pso::CreationError::ShaderCreationError(stage.into(), error)
-                })?;
-                &info_owned
-            }
+            result.map_err(|e| {
+                let error = format!("Error compiling the shader {:?}", e);
+                pso::CreationError::ShaderCreationError(stage.into(), error)
+            })?
         };
+
+        // collect sizes indices
+        let mut sized_bindings = Vec::new();
+        if let Ok(ref shader) = ep.module.naga {
+            for (_handle, var) in shader.module.global_variables.iter() {
+                if let naga::TypeInner::Struct { ref members, .. } =
+                    shader.module.types[var.ty].inner
+                {
+                    if let Some(member) = members.last() {
+                        if let naga::TypeInner::Array {
+                            size: naga::ArraySize::Dynamic,
+                            ..
+                        } = shader.module.types[member.ty].inner
+                        {
+                            // Note: unwraps are fine, since the MSL is already generated
+                            let br = var.binding.clone().unwrap();
+                            sized_bindings.push(br);
+                        }
+                    }
+                }
+            }
+        }
 
         let lib = info.library.clone();
         let entry_key = (stage, ep.entry.to_string());
@@ -885,7 +953,13 @@ impl Device {
             pso::CreationError::ShaderCreationError(stage.into(), error)
         })?;
 
-        Ok((lib, mtl_function, wg_size, info.rasterization_enabled))
+        Ok(CompiledShader {
+            library: lib,
+            function: mtl_function,
+            wg_size,
+            rasterizing: info.rasterization_enabled,
+            sized_bindings,
+        })
     }
 
     fn make_sampler_descriptor(
@@ -1093,31 +1167,40 @@ impl hal::device::Device<Backend> for Device {
         Is: Iterator<Item = &'a n::DescriptorSetLayout>,
         Ic: Iterator<Item = (pso::ShaderStageFlags, Range<u32>)>,
     {
+        #[derive(Debug)]
         struct StageInfo {
             stage: naga::ShaderStage,
             counters: n::ResourceData<ResourceIndex>,
             push_constant_buffer: Option<ResourceIndex>,
+            sizes_buffer: Option<ResourceIndex>,
+            sizes_count: u8,
         }
         let mut stage_infos = [
             StageInfo {
                 stage: naga::ShaderStage::Vertex,
                 counters: n::ResourceData::new(),
                 push_constant_buffer: None,
+                sizes_buffer: None,
+                sizes_count: 0,
             },
             StageInfo {
                 stage: naga::ShaderStage::Fragment,
                 counters: n::ResourceData::new(),
                 push_constant_buffer: None,
+                sizes_buffer: None,
+                sizes_count: 0,
             },
             StageInfo {
                 stage: naga::ShaderStage::Compute,
                 counters: n::ResourceData::new(),
                 push_constant_buffer: None,
+                sizes_buffer: None,
+                sizes_count: 0,
             },
         ];
-        let mut binding_map = FastHashMap::default();
+        let mut binding_map = BTreeMap::default();
         let mut argument_buffer_bindings = FastHashMap::default();
-        let mut inline_samplers = naga::Arena::new();
+        let mut inline_samplers = Vec::new();
         #[cfg(feature = "cross")]
         let mut cross_const_samplers = BTreeMap::new();
         let mut infos = Vec::new();
@@ -1155,11 +1238,13 @@ impl hal::device::Device<Backend> for Device {
         for (set_index, set_layout) in set_layouts.enumerate() {
             // remember where the resources for this set start at each shader stage
             let mut dynamic_buffers = Vec::new();
+            let mut sized_buffer_bindings = Vec::new();
             let offsets = n::MultiStageResourceCounters {
                 vs: stage_infos[0].counters.clone(),
                 ps: stage_infos[1].counters.clone(),
                 cs: stage_infos[2].counters.clone(),
             };
+
             match *set_layout {
                 n::DescriptorSetLayout::Emulated {
                     layouts: ref desc_layouts,
@@ -1178,6 +1263,19 @@ impl hal::device::Device<Backend> for Device {
                         );
                     }
                     for layout in desc_layouts.iter() {
+                        if layout.content.contains(n::DescriptorContent::SIZED_BUFFER) {
+                            sized_buffer_bindings.push((layout.binding, layout.stages));
+                            if layout.stages.contains(pso::ShaderStageFlags::VERTEX) {
+                                stage_infos[0].sizes_count += 1;
+                            }
+                            if layout.stages.contains(pso::ShaderStageFlags::FRAGMENT) {
+                                stage_infos[1].sizes_count += 1;
+                            }
+                            if layout.stages.contains(pso::ShaderStageFlags::COMPUTE) {
+                                stage_infos[2].sizes_count += 1;
+                            }
+                        }
+
                         if layout
                             .content
                             .contains(n::DescriptorContent::DYNAMIC_BUFFER)
@@ -1200,6 +1298,7 @@ impl hal::device::Device<Backend> for Device {
                                 },
                             });
                         }
+
                         for info in stage_infos.iter_mut() {
                             if !layout.stages.contains(info.stage.into()) {
                                 continue;
@@ -1220,8 +1319,9 @@ impl hal::device::Device<Backend> for Device {
                                     .contains(n::DescriptorContent::IMMUTABLE_SAMPLER)
                                 {
                                     let immutable_sampler = &immutable_samplers[&layout.binding];
-                                    let handle =
-                                        inline_samplers.append(immutable_sampler.data.clone());
+                                    let handle = inline_samplers.len()
+                                        as naga::back::msl::InlineSamplerIndex;
+                                    inline_samplers.push(immutable_sampler.data.clone());
                                     Some(naga::back::msl::BindSamplerTarget::Inline(handle))
                                 } else if layout.content.contains(n::DescriptorContent::SAMPLER) {
                                     Some(naga::back::msl::BindSamplerTarget::Resource(
@@ -1264,14 +1364,24 @@ impl hal::device::Device<Backend> for Device {
             infos.alloc().init(n::DescriptorSetInfo {
                 offsets,
                 dynamic_buffers,
+                sized_buffer_bindings,
             });
         }
 
         // Finally, make sure we fit the limits
-        for info in stage_infos.iter() {
-            assert!(info.counters.buffers <= self.shared.private_caps.max_buffers_per_stage);
-            assert!(info.counters.textures <= self.shared.private_caps.max_textures_per_stage);
-            assert!(info.counters.samplers <= self.shared.private_caps.max_samplers_per_stage);
+        for info in stage_infos.iter_mut() {
+            // handle the sizes buffer assignment and shader overrides
+            if info.sizes_count != 0 {
+                info.sizes_buffer = Some(info.counters.buffers);
+                info.counters.buffers += 1;
+            }
+            if info.counters.buffers > self.shared.private_caps.max_buffers_per_stage
+                || info.counters.textures > self.shared.private_caps.max_textures_per_stage
+                || info.counters.samplers > self.shared.private_caps.max_samplers_per_stage
+            {
+                log::error!("Resource limit exceeded: {:?}", info);
+                return Err(d::OutOfMemory::Host);
+            }
         }
 
         #[cfg(feature = "cross")]
@@ -1373,6 +1483,32 @@ impl hal::device::Device<Backend> for Device {
             inline_samplers,
             spirv_cross_compatibility: cfg!(feature = "cross"),
             fake_missing_bindings: false,
+            per_stage_map: naga::back::msl::PerStageMap {
+                vs: naga::back::msl::PerStageResources {
+                    push_constant_buffer: stage_infos[0]
+                        .push_constant_buffer
+                        .map(|buffer_index| buffer_index as naga::back::msl::Slot),
+                    sizes_buffer: stage_infos[0]
+                        .sizes_buffer
+                        .map(|buffer_index| buffer_index as naga::back::msl::Slot),
+                },
+                fs: naga::back::msl::PerStageResources {
+                    push_constant_buffer: stage_infos[1]
+                        .push_constant_buffer
+                        .map(|buffer_index| buffer_index as naga::back::msl::Slot),
+                    sizes_buffer: stage_infos[1]
+                        .sizes_buffer
+                        .map(|buffer_index| buffer_index as naga::back::msl::Slot),
+                },
+                cs: naga::back::msl::PerStageResources {
+                    push_constant_buffer: stage_infos[2]
+                        .push_constant_buffer
+                        .map(|buffer_index| buffer_index as naga::back::msl::Slot),
+                    sizes_buffer: stage_infos[2]
+                        .sizes_buffer
+                        .map(|buffer_index| buffer_index as naga::back::msl::Slot),
+                },
+            },
         };
 
         Ok(n::PipelineLayout {
@@ -1409,71 +1545,133 @@ impl hal::device::Device<Backend> for Device {
         })
     }
 
+    #[cfg(not(feature = "pipeline-cache"))]
     unsafe fn create_pipeline_cache(
         &self,
         _data: Option<&[u8]>,
     ) -> Result<n::PipelineCache, d::OutOfMemory> {
-        Ok(n::PipelineCache {
-            #[cfg(feature = "cross")]
-            modules: FastStorageMap::default(),
-        })
+        Ok(())
     }
 
+    #[cfg(feature = "pipeline-cache")]
+    unsafe fn create_pipeline_cache(
+        &self,
+        data: Option<&[u8]>,
+    ) -> Result<n::PipelineCache, d::OutOfMemory> {
+        let device = self.shared.device.lock();
+
+        let create_binary_archive = |data: &[u8]| {
+            if self.shared.private_caps.supports_binary_archives {
+                let descriptor = metal::BinaryArchiveDescriptor::new();
+
+                // We need to keep the temp file alive so that it doesn't get deleted until after a
+                // binary archive has been created.
+                let _temp_file = if !data.is_empty() {
+                    // It would be nice to use a `data:text/plain;base64` url here and just pass in a
+                    // base64-encoded version of the data, but metal validation doesn't like that:
+                    // -[MTLDebugDevice newBinaryArchiveWithDescriptor:error:]:1046: failed assertion `url, if not nil, must be a file URL.'
+
+                    let temp_file = tempfile::NamedTempFile::new().unwrap();
+                    temp_file.as_file().write_all(&data).unwrap();
+
+                    let url = metal::URL::new_with_string(&format!(
+                        "file://{}",
+                        temp_file.path().display()
+                    ));
+                    descriptor.set_url(&url);
+
+                    Some(temp_file)
+                } else {
+                    None
+                };
+
+                Ok(Some(pipeline_cache::BinaryArchive {
+                    inner: device
+                        .new_binary_archive_with_descriptor(&descriptor)
+                        .map_err(|_| d::OutOfMemory::Device)?,
+                    is_empty: AtomicBool::new(data.is_empty()),
+                }))
+            } else {
+                Ok(None)
+            }
+        };
+
+        if let Some(data) = data.filter(|data| !data.is_empty()) {
+            let pipeline_cache: pipeline_cache::SerializablePipelineCache =
+                bincode::deserialize(data).unwrap();
+
+            Ok(n::PipelineCache {
+                binary_archive: create_binary_archive(&pipeline_cache.binary_archive)?,
+                spv_to_msl: pipeline_cache::load_spv_to_msl_cache(pipeline_cache.spv_to_msl),
+            })
+        } else {
+            Ok(n::PipelineCache {
+                binary_archive: create_binary_archive(&[])?,
+                spv_to_msl: Default::default(),
+            })
+        }
+    }
+
+    #[cfg(not(feature = "pipeline-cache"))]
     unsafe fn get_pipeline_cache_data(
         &self,
         _cache: &n::PipelineCache,
     ) -> Result<Vec<u8>, d::OutOfMemory> {
-        //empty
         Ok(Vec::new())
+    }
+
+    #[cfg(feature = "pipeline-cache")]
+    unsafe fn get_pipeline_cache_data(
+        &self,
+        cache: &n::PipelineCache,
+    ) -> Result<Vec<u8>, d::OutOfMemory> {
+        let binary_archive = || {
+            let binary_archive = match cache.binary_archive {
+                Some(ref binary_archive) => binary_archive,
+                None => return Ok(Vec::new()),
+            };
+
+            // Without this, we get an extremely vague "Serialization of binaries to file failed"
+            // error when serializing an empty binary archive.
+            if binary_archive.is_empty.load(Ordering::Relaxed) {
+                return Ok(Vec::new());
+            }
+
+            let temp_path = tempfile::NamedTempFile::new().unwrap().into_temp_path();
+            let tmp_file_url =
+                metal::URL::new_with_string(&format!("file://{}", temp_path.display()));
+
+            binary_archive
+                .inner
+                .serialize_to_url(&tmp_file_url)
+                .unwrap();
+
+            let bytes = std::fs::read(&temp_path).unwrap();
+            Ok(bytes)
+        };
+
+        Ok(
+            bincode::serialize(&pipeline_cache::SerializablePipelineCache {
+                binary_archive: &binary_archive()?,
+                spv_to_msl: pipeline_cache::serialize_spv_to_msl_cache(&cache.spv_to_msl),
+            })
+            .unwrap(),
+        )
     }
 
     unsafe fn destroy_pipeline_cache(&self, _cache: n::PipelineCache) {
         //drop
     }
 
-    #[cfg_attr(not(feature = "cross"), allow(unused_variables))]
     unsafe fn merge_pipeline_caches<'a, I>(
         &self,
-        target: &mut n::PipelineCache,
-        sources: I,
+        _target: &mut n::PipelineCache,
+        _sources: I,
     ) -> Result<(), d::OutOfMemory>
     where
         I: Iterator<Item = &'a n::PipelineCache>,
     {
-        #[cfg(feature = "cross")]
-        {
-            //TODO: reduce the locking here
-            let mut dst = target.modules.whole_write();
-            for source in sources {
-                let src = source.modules.whole_write();
-                for (key, value) in src.iter() {
-                    let storage = dst
-                        .entry(key.clone())
-                        .or_insert_with(FastStorageMap::default);
-                    let mut dst_module = storage.whole_write();
-                    let src_module = value.whole_write();
-                    for (key_module, value_module) in src_module.iter() {
-                        match dst_module.entry(key_module.clone()) {
-                            Entry::Vacant(em) => {
-                                em.insert(value_module.clone());
-                            }
-                            Entry::Occupied(em) => {
-                                if em.get().library.as_ptr() != value_module.library.as_ptr()
-                                    || em.get().entry_point_map != value_module.entry_point_map
-                                {
-                                    warn!(
-                                        "Merged module don't match, target: {:?}, source: {:?}",
-                                        em.get(),
-                                        value_module
-                                    );
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-
+        warn!("`merge_pipeline_caches` is not currently implemented on the Metal backend.");
         Ok(())
     }
 
@@ -1492,7 +1690,7 @@ impl hal::device::Device<Backend> for Device {
             (&main_pass.attachments, &main_pass.subpasses[index as usize])
         };
 
-        let (desc_vertex_buffers, attributes, input_assembler, vs) =
+        let (desc_vertex_buffers, attributes, input_assembler, vs_ep) =
             match pipeline_desc.primitive_assembler {
                 pso::PrimitiveAssemblerDesc::Vertex {
                     tessellation: Some(_),
@@ -1547,30 +1745,25 @@ impl hal::device::Device<Backend> for Device {
         }
 
         // Vertex shader
-        let (vs_lib, vs_function, _, enable_rasterization) = self.load_shader(
-            vs,
+        let vs = self.load_shader(
+            vs_ep,
             pipeline_layout,
             primitive_class,
             cache,
             naga::ShaderStage::Vertex,
         )?;
-        pipeline.set_vertex_function(Some(&vs_function));
+
+        pipeline.set_vertex_function(Some(&vs.function));
 
         // Fragment shader
-        let fs_function;
-        let fs_lib = match pipeline_desc.fragment {
-            Some(ref ep) => {
-                let (lib, fun, _, _) = self.load_shader(
-                    ep,
-                    pipeline_layout,
-                    primitive_class,
-                    cache,
-                    naga::ShaderStage::Fragment,
-                )?;
-                fs_function = fun;
-                pipeline.set_fragment_function(Some(&fs_function));
-                Some(lib)
-            }
+        let fs = match pipeline_desc.fragment {
+            Some(ref ep) => Some(self.load_shader(
+                ep,
+                pipeline_layout,
+                primitive_class,
+                cache,
+                naga::ShaderStage::Fragment,
+            )?),
             None => {
                 // TODO: This is a workaround for what appears to be a Metal validation bug
                 // A pixel format is required even though no attachments are provided
@@ -1583,7 +1776,10 @@ impl hal::device::Device<Backend> for Device {
             }
         };
 
-        pipeline.set_rasterization_enabled(enable_rasterization);
+        if let Some(ref compiled) = fs {
+            pipeline.set_fragment_function(Some(&compiled.function));
+        }
+        pipeline.set_rasterization_enabled(vs.rasterizing);
 
         // Assign target formats
         let blend_targets = pipeline_desc
@@ -1777,15 +1973,46 @@ impl hal::device::Device<Backend> for Device {
         }
 
         profiling::scope!("Metal::new_render_pipeline_state");
-        device
+
+        #[cfg(feature = "pipeline-cache")]
+        if let Some(binary_archive) = pipeline_cache::pipeline_cache_to_binary_archive(cache) {
+            pipeline.set_binary_archives(&[&binary_archive.inner]);
+        }
+
+        let (fs_lib, ps_sized_bindings) = match fs {
+            Some(compiled) => (Some(compiled.library), compiled.sized_bindings),
+            None => (None, Vec::new()),
+        };
+
+        let pipeline_state = device
+            // Replace this with `new_render_pipeline_state_with_fail_on_binary_archive_miss`
+            // to debug that the cache is actually working.
             .new_render_pipeline_state(&pipeline)
             .map(|raw| n::GraphicsPipeline {
-                vs_lib,
+                vs_lib: vs.library,
                 fs_lib,
                 raw,
                 primitive_type,
-                vs_pc_info: pipeline_desc.layout.push_constants.vs,
-                ps_pc_info: pipeline_desc.layout.push_constants.ps,
+                vs_info: n::PipelineStageInfo {
+                    push_constants: pipeline_desc.layout.push_constants.vs,
+                    sizes_slot: pipeline_desc
+                        .layout
+                        .naga_options
+                        .per_stage_map
+                        .vs
+                        .sizes_buffer,
+                    sized_bindings: vs.sized_bindings,
+                },
+                ps_info: n::PipelineStageInfo {
+                    push_constants: pipeline_desc.layout.push_constants.ps,
+                    sizes_slot: pipeline_desc
+                        .layout
+                        .naga_options
+                        .per_stage_map
+                        .fs
+                        .sizes_buffer,
+                    sized_bindings: ps_sized_bindings,
+                },
                 rasterizer_state,
                 depth_bias,
                 depth_stencil_desc: pipeline_desc.depth_stencil.clone(),
@@ -1797,7 +2024,21 @@ impl hal::device::Device<Backend> for Device {
             .map_err(|err| {
                 error!("PSO creation failed: {}", err);
                 pso::CreationError::Other
-            })
+            })?;
+
+        // We need to add the pipline descriptor to the binary archive after creating the
+        // pipeline, otherwise `new_render_pipeline_state_with_fail_on_binary_archive_miss`
+        // succeeds when it shouldn't.
+        #[cfg(feature = "pipeline-cache")]
+        if let Some(binary_archive) = pipeline_cache::pipeline_cache_to_binary_archive(cache) {
+            binary_archive
+                .inner
+                .add_render_pipeline_functions_with_descriptor(&pipeline)
+                .unwrap();
+            binary_archive.is_empty.store(false, Ordering::Relaxed);
+        }
+
+        Ok(pipeline_state)
     }
 
     unsafe fn create_compute_pipeline<'a>(
@@ -1809,33 +2050,62 @@ impl hal::device::Device<Backend> for Device {
         trace!("create_compute_pipeline {:?}", pipeline_desc);
         let pipeline = metal::ComputePipelineDescriptor::new();
 
-        let (cs_lib, cs_function, work_group_size, _) = self.load_shader(
+        let cs = self.load_shader(
             &pipeline_desc.shader,
             &pipeline_desc.layout,
             MTLPrimitiveTopologyClass::Unspecified,
             cache,
             naga::ShaderStage::Compute,
         )?;
-        pipeline.set_compute_function(Some(&cs_function));
+        pipeline.set_compute_function(Some(&cs.function));
         if let Some(name) = pipeline_desc.label {
             pipeline.set_label(name);
         }
 
         profiling::scope!("Metal::new_compute_pipeline_state");
-        self.shared
+
+        #[cfg(feature = "pipeline-cache")]
+        if let Some(binary_archive) = pipeline_cache::pipeline_cache_to_binary_archive(cache) {
+            pipeline.set_binary_archives(&[&binary_archive.inner]);
+        }
+
+        let pipeline_state = self
+            .shared
             .device
             .lock()
             .new_compute_pipeline_state(&pipeline)
             .map(|raw| n::ComputePipeline {
-                cs_lib,
+                cs_lib: cs.library,
                 raw,
-                work_group_size,
-                pc_info: pipeline_desc.layout.push_constants.cs,
+                work_group_size: cs.wg_size,
+                info: n::PipelineStageInfo {
+                    push_constants: pipeline_desc.layout.push_constants.cs,
+                    sizes_slot: pipeline_desc
+                        .layout
+                        .naga_options
+                        .per_stage_map
+                        .cs
+                        .sizes_buffer,
+                    sized_bindings: cs.sized_bindings,
+                },
             })
             .map_err(|err| {
                 error!("PSO creation failed: {}", err);
                 pso::CreationError::Other
-            })
+            })?;
+
+        // We need to add the pipline descriptor to the binary archive after creating the
+        // pipeline, see `create_graphics_pipeline`.
+        #[cfg(feature = "pipeline-cache")]
+        if let Some(binary_archive) = pipeline_cache::pipeline_cache_to_binary_archive(cache) {
+            binary_archive
+                .inner
+                .add_compute_pipeline_functions_with_descriptor(&pipeline)
+                .unwrap();
+            binary_archive.is_empty.store(false, Ordering::Relaxed)
+        }
+
+        Ok(pipeline_state)
     }
 
     unsafe fn create_framebuffer<I>(
@@ -1853,23 +2123,34 @@ impl hal::device::Device<Backend> for Device {
     ) -> Result<n::ShaderModule, d::ShaderError> {
         profiling::scope!("create_shader_module");
         Ok(n::ShaderModule {
-            prefer_naga: self.always_prefer_naga,
             #[cfg(feature = "cross")]
             spv: raw_data.to_vec(),
-            naga: {
+            #[cfg(feature = "pipeline-cache")]
+            spv_hash: fxhash::hash64(raw_data),
+            naga: if cfg!(feature = "cross") {
+                Err("Cross is enabled".into())
+            } else {
                 let options = naga::front::spv::Options {
                     adjust_coordinate_space: !self.features.contains(hal::Features::NDC_Y_UP),
+                    strict_capabilities: true,
                     flow_graph_dump_prefix: None,
                 };
-                let parser = naga::front::spv::Parser::new(raw_data.iter().cloned(), &options);
-                match parser.parse() {
+                let parse_result = {
+                    profiling::scope!("naga::spv::parse");
+                    let parser = naga::front::spv::Parser::new(raw_data.iter().cloned(), &options);
+                    parser.parse()
+                };
+                match parse_result {
                     Ok(module) => {
                         debug!("Naga module {:#?}", module);
-                        match naga::valid::Validator::new(naga::valid::ValidationFlags::empty())
-                            .validate(&module)
+                        match naga::valid::Validator::new(
+                            naga::valid::ValidationFlags::empty(),
+                            naga::valid::Capabilities::PUSH_CONSTANT,
+                        )
+                        .validate(&module)
                         {
                             Ok(info) => Ok(d::NagaShader { module, info }),
-                            Err(e) => Err(format!("Naga validation: {:?}", e)),
+                            Err(e) => Err(format!("Naga validation: {}", e)),
                         }
                     }
                     Err(e) => Err(format!("Naga parsing: {:?}", e)),
@@ -1883,15 +2164,19 @@ impl hal::device::Device<Backend> for Device {
         shader: d::NagaShader,
     ) -> Result<n::ShaderModule, (d::ShaderError, d::NagaShader)> {
         profiling::scope!("create_shader_module_from_naga");
+
+        #[cfg(any(feature = "pipeline-cache", feature = "cross"))]
+        let spv = match naga::back::spv::write_vec(&shader.module, &shader.info, &self.spv_options)
+        {
+            Ok(spv) => spv,
+            Err(e) => return Err((d::ShaderError::CompilationFailed(format!("{}", e)), shader)),
+        };
+
         Ok(n::ShaderModule {
-            prefer_naga: true,
+            #[cfg(feature = "pipeline-cache")]
+            spv_hash: fxhash::hash64(&spv),
             #[cfg(feature = "cross")]
-            spv: match naga::back::spv::write_vec(&shader.module, &shader.info, &self.spv_options) {
-                Ok(spv) => spv,
-                Err(e) => {
-                    return Err((d::ShaderError::CompilationFailed(format!("{}", e)), shader))
-                }
-            },
+            spv,
             naga: Ok(shader),
         })
     }
@@ -2110,18 +2395,26 @@ impl hal::device::Device<Backend> for Device {
                 let usage = n::ArgumentArray::describe_usage(desc.ty);
                 let bind_target = naga::back::msl::BindTarget {
                     buffer: if content.contains(n::DescriptorContent::BUFFER) {
-                        Some(arguments.push(metal::MTLDataType::Pointer, desc.count, usage) as u8)
+                        Some(
+                            arguments.push(metal::MTLDataType::Pointer, desc.count, usage)
+                                as naga::back::msl::Slot,
+                        )
                     } else {
                         None
                     },
                     texture: if content.contains(n::DescriptorContent::TEXTURE) {
-                        Some(arguments.push(metal::MTLDataType::Texture, desc.count, usage) as u8)
+                        Some(
+                            arguments.push(metal::MTLDataType::Texture, desc.count, usage)
+                                as naga::back::msl::Slot,
+                        )
                     } else {
                         None
                     },
                     sampler: if content.contains(n::DescriptorContent::SAMPLER) {
                         let slot = arguments.push(metal::MTLDataType::Sampler, desc.count, usage);
-                        Some(naga::back::msl::BindSamplerTarget::Resource(slot as u8))
+                        Some(naga::back::msl::BindSamplerTarget::Resource(
+                            slot as naga::back::msl::Slot,
+                        ))
                     } else {
                         None
                     },
@@ -2294,10 +2587,20 @@ impl hal::device::Device<Backend> for Device {
                             debug_assert!(
                                 range.start + sub.offset + sub.size.unwrap_or(0) <= range.end
                             );
+                            let raw_binding_size = match sub.size {
+                                Some(size) => size,
+                                None => range.end - range.start - sub.offset,
+                            };
                             data.buffers[counters.buffers as usize] = (
                                 layout.stages,
                                 Some(AsNative::from(raw)),
                                 range.start + sub.offset,
+                                layout.binding,
+                                if layout.content.contains(n::DescriptorContent::SIZED_BUFFER) {
+                                    raw_binding_size.min(u32::MAX as buffer::Offset - 1) as u32
+                                } else {
+                                    !0
+                                },
                             );
                         }
                     }
@@ -2408,6 +2711,7 @@ impl hal::device::Device<Backend> for Device {
         memory_type: hal::MemoryTypeId,
         size: u64,
     ) -> Result<n::Memory, d::AllocationError> {
+        profiling::scope!("allocate_memory");
         let (storage, cache) = MemoryTypes::describe(memory_type.0);
         let device = self.shared.device.lock();
         debug!("allocate_memory type {:?} of size {}", memory_type, size);
@@ -2437,6 +2741,7 @@ impl hal::device::Device<Backend> for Device {
     }
 
     unsafe fn free_memory(&self, memory: n::Memory) {
+        profiling::scope!("free_memory");
         debug!("free_memory of size {}", memory.size);
         if let n::MemoryHeap::Public(_, ref cpu_buffer) = memory.heap {
             debug!("\tbacked by cpu buffer {:?}", cpu_buffer.as_ptr());
@@ -2504,6 +2809,7 @@ impl hal::device::Device<Backend> for Device {
         offset: u64,
         buffer: &mut n::Buffer,
     ) -> Result<(), d::BindError> {
+        profiling::scope!("bind_buffer_memory");
         let (size, name) = match buffer {
             n::Buffer::Unbound { size, name, .. } => (*size, name),
             n::Buffer::Bound { .. } => panic!("Unexpected Buffer::Bound"),
@@ -2648,6 +2954,7 @@ impl hal::device::Device<Backend> for Device {
         _sparse: memory::SparseFlags,
         view_caps: image::ViewCapabilities,
     ) -> Result<n::Image, image::CreationError> {
+        profiling::scope!("create_image");
         debug!(
             "create_image {:?} with {} mips of {:?} {:?} and usage {:?} with {:?}",
             kind, mip_levels, format, tiling, usage, view_caps
@@ -2836,6 +3143,7 @@ impl hal::device::Device<Backend> for Device {
         offset: u64,
         image: &mut n::Image,
     ) -> Result<(), d::BindError> {
+        profiling::scope!("bind_image_memory");
         let like = {
             let (descriptor, mip_sizes, name) = match image.like {
                 n::ImageLike::Unbound {
@@ -2904,8 +3212,11 @@ impl hal::device::Device<Backend> for Device {
         kind: image::ViewKind,
         format: format::Format,
         swizzle: format::Swizzle,
+        _usage: image::Usage,
         range: image::SubresourceRange,
     ) -> Result<n::ImageView, image::ViewCreationError> {
+        profiling::scope!("create_image_view");
+
         let mtl_format = match self
             .shared
             .private_caps
@@ -3242,6 +3553,97 @@ impl hal::device::Device<Backend> for Device {
     ) {
         // TODO
     }
+
+    unsafe fn set_display_power_state(
+        &self,
+        _display: &display::Display<Backend>,
+        _power_state: &display::control::PowerState,
+    ) -> Result<(), display::control::DisplayControlError> {
+        unimplemented!()
+    }
+
+    unsafe fn register_device_event(
+        &self,
+        _device_event: &display::control::DeviceEvent,
+        _fence: &mut <Backend as hal::Backend>::Fence,
+    ) -> Result<(), display::control::DisplayControlError> {
+        unimplemented!()
+    }
+
+    unsafe fn register_display_event(
+        &self,
+        _display: &display::Display<Backend>,
+        _display_event: &display::control::DisplayEvent,
+        _fence: &mut <Backend as hal::Backend>::Fence,
+    ) -> Result<(), display::control::DisplayControlError> {
+        unimplemented!()
+    }
+
+    unsafe fn create_allocate_external_buffer(
+        &self,
+        _external_memory_type: hal::external_memory::ExternalBufferMemoryType,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _type_mask: u32,
+        _size: u64,
+    ) -> Result<(n::Buffer, n::Memory), hal::external_memory::ExternalResourceError>
+    {
+        unimplemented!()
+    }
+
+    unsafe fn import_external_buffer(
+        &self,
+        _external_memory: hal::external_memory::ExternalBufferMemory,
+        _usage: hal::buffer::Usage,
+        _sparse: hal::memory::SparseFlags,
+        _mem_types: u32,
+        _size: u64,
+    ) -> Result<(n::Buffer, n::Memory), hal::external_memory::ExternalResourceError> {
+        unimplemented!()
+    }
+
+    unsafe fn create_allocate_external_image(
+        &self,
+        _external_memory_type: hal::external_memory::ExternalImageMemoryType,
+        _kind: image::Kind,
+        _num_levels: image::Level,
+        _format: hal::format::Format,
+        _tiling: image::Tiling,
+        _usage: image::Usage,
+        _sparse: memory::SparseFlags,
+        _view_caps: image::ViewCapabilities,
+        _type_mask: u32,
+    ) -> Result<(n::Image, n::Memory), hal::external_memory::ExternalResourceError> {
+        unimplemented!()
+    }
+
+    unsafe fn import_external_image(
+        &self,
+        _external_memory: hal::external_memory::ExternalImageMemory,
+        _kind: image::Kind,
+        _num_levels: image::Level,
+        _format: hal::format::Format,
+        _tiling: image::Tiling,
+        _usage: image::Usage,
+        _sparse: memory::SparseFlags,
+        _view_caps: image::ViewCapabilities,
+        _type_mask: u32,
+    ) -> Result<(n::Image, n::Memory), hal::external_memory::ExternalResourceError> {
+        unimplemented!()
+    }
+
+    unsafe fn export_memory(
+        &self,
+        _external_memory_type: hal::external_memory::ExternalMemoryType,
+        _memory: &n::Memory,
+    ) -> Result<hal::external_memory::PlatformMemory, hal::external_memory::ExternalMemoryExportError>
+    {
+        unimplemented!()
+    }
+
+    /// Query the underlying drm format modifier from an image.
+    unsafe fn drm_format_modifier(&self, _image: &n::Image) -> Option<hal::format::DrmModifier>{None}
+
 
     fn start_capture(&self) {
         let device = self.shared.device.lock();
